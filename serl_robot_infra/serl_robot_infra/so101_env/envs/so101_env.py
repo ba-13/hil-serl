@@ -33,6 +33,7 @@ from scipy.spatial.transform import Rotation
 from serl_robot_infra.so101_env.camera.usb_capture import USBCapture
 from serl_robot_infra.so101_env.camera.video_capture import VideoCapture
 from serl_robot_infra.franka_env.utils.rotations import euler_2_quat
+from serl_robot_infra.so101_env.envs.so101_client import So101RosClient
 
 
 class ImageDisplayer(threading.Thread):
@@ -49,7 +50,12 @@ class ImageDisplayer(threading.Thread):
                 break
 
             frame = np.concatenate(
-                [cv2.resize(v, (128, 128)) for k, v in img_array.items() if "full" not in k], axis=1
+                [
+                    cv2.resize(v, (128, 128))
+                    for k, v in img_array.items()
+                    if "full" not in k
+                ],
+                axis=1,
             )
 
             cv2.imshow(self.name, frame)
@@ -66,12 +72,13 @@ class DefaultSO101EnvConfig:
 
     CAMERAS: Dict = {
         "cam_wrist": {
-            "serial_number": "/dev/cam_wrist",
+            "device": "/dev/cam_wrist",
             "dim": (640, 480),
+            "fps": 30,
             "exposure": 10500,
         }
     }
-    IMAGE_CROP: dict[str, callable] = {}
+    IMAGE_CROP: dict[str, callable] = {}  # type: ignore
 
     TARGET_POSE: np.ndarray = np.zeros((6,))
     REWARD_THRESHOLD: np.ndarray = np.zeros((6,))
@@ -81,6 +88,10 @@ class DefaultSO101EnvConfig:
     RANDOM_RESET = False
     RANDOM_XY_RANGE = 0.0
     RANDOM_RZ_RANGE = 0.0
+
+    COMPLIANCE_PARAM: Dict[str, float] = {}
+    RESET_PARAM: Dict[str, float] = {}
+    PRECISION_PARAM: Dict[str, float] = {}
 
     ABS_POSE_LIMIT_HIGH = np.zeros((6,))
     ABS_POSE_LIMIT_LOW = np.zeros((6,))
@@ -131,18 +142,19 @@ class So101Env(gym.Env):
         self.random_rz_range = self.config.RANDOM_RZ_RANGE
         self.hz = hz
 
+        # convert last 3 elements from euler to quat, from size (6,) to (7,)
         self.resetpos = np.concatenate(
             [self._RESET_POSE[:3], euler_2_quat(self._RESET_POSE[3:])]
         )
 
         self.last_gripper_act = time.time()
         self.lastsent = time.time()
-        self.cycle_count = 0
+        self.cycle_count = 0  # counts number of resets
         self.curr_path_length = 0
         self.terminate = False
 
         self.save_video = save_video
-        self.recording_frames = [] if self.save_video else None
+        self.recording_frames = []
 
         self.xyz_bounding_box = gym.spaces.Box(
             self.config.ABS_POSE_LIMIT_LOW[:3],
@@ -182,7 +194,7 @@ class So101Env(gym.Env):
                         key: gym.spaces.Box(
                             0,
                             255,
-                            shape=(*val["dim"], 3), # W x H x C
+                            shape=(*val["dim"], 3),  # W x H x C
                             dtype=np.uint8,
                         )
                         for key, val in self.config.CAMERAS
@@ -200,7 +212,11 @@ class So101Env(gym.Env):
 
         if fake_env:
             self.cap = None
+            self.ros_client = None
             return
+
+        # Initialize ROS2 client
+        self.ros_client = So101RosClient(namespace=self.config.ROS_NAMESPACE)
 
         self.cap = None
         self.init_cameras(self.config.CAMERAS)
@@ -244,7 +260,7 @@ class So101Env(gym.Env):
 
     def step(self, action: np.ndarray) -> tuple:
         start_time = time.time()
-        action = np.clip(action, self.action_space.low, self.action_space.high)
+        action = np.clip(action, self.action_space.low, self.action_space.high)  # type: ignore
         xyz_delta = action[:3]
 
         self.nextpos = self.currpos.copy()  # angles aren't used
@@ -272,7 +288,7 @@ class So101Env(gym.Env):
         return obs, int(reward), done, False, {"succeed": bool(reward)}
 
     def compute_reward(self, obs) -> bool:
-        """Default sparse success check.
+        """Default going to a target pose reward
 
         Override this if the task reward comes from a classifier or a different signal.
         """
@@ -287,6 +303,12 @@ class So101Env(gym.Env):
         return bool(np.all(delta < self._REWARD_THRESHOLD))
 
     def get_im(self) -> Dict[str, np.ndarray]:
+        """Goes through each camera, captures the image, makes it policy compatible dimensions, saves frames for cv window or video later
+        NOTE: We don't crop the image or resize it here, and expose the original image as observations
+
+        Returns:
+            Dict[str, np.ndarray]: camera_key -> image
+        """
         assert self.cap is not None
 
         images = {}
@@ -300,10 +322,7 @@ class So101Env(gym.Env):
                     if key in self.config.IMAGE_CROP
                     else rgb
                 )
-                # target_shape = self.observation_space["images"][key].shape[:2][::-1]
-                # resized = cv2.resize(cropped_rgb, target_shape)
                 # cv reads with BGR, convert to RGB before sending
-                # images[key] = resized[..., ::-1]
                 images[key] = cv2.cvtColor(cropped_rgb, cv2.COLOR_BGR2RGB)
                 display_images[key] = cropped_rgb
                 full_res_images[key] = copy.deepcopy(cropped_rgb)
@@ -339,8 +358,17 @@ class So101Env(gym.Env):
 
         Replace this if your robot needs a special homing or recovery sequence.
         """
+        self._update_currpos()
+        self._send_pos_command(self.currpos)  # let the current pose settle
+        self._send_gripper_command(-1.0)
+        time.sleep(0.5)
+        self._update_param(self.config.PRECISION_PARAM)
+        time.sleep(0.5)
+
         if joint_reset:
+            print("JOINT RESET")
             self._reset_robot_joints()
+            time.sleep(0.5)
 
         if self.randomreset:
             reset_pose = self.resetpos.copy()
@@ -356,6 +384,7 @@ class So101Env(gym.Env):
             reset_pose = self.resetpos.copy()
 
         self.interpolate_move(reset_pose, timeout=1.0)
+        self._update_param(self.config.COMPLIANCE_PARAM)
 
     def reset(self, joint_reset: bool = False, **kwargs):
         self.last_gripper_act = time.time()
@@ -382,7 +411,7 @@ class So101Env(gym.Env):
 
     def save_video_recording(self):
         try:
-            if self.recording_frames and len(self.recording_frames):
+            if self.save_video and len(self.recording_frames):
                 if not os.path.exists("./videos"):
                     os.makedirs("./videos")
 
@@ -406,7 +435,7 @@ class So101Env(gym.Env):
         except Exception as e:
             print(f"Failed to save video: {e}")
 
-    def init_cameras(self, name_serial_dict: dict = None):
+    def init_cameras(self, name_serial_dict: dict = None):  # type: ignore
         """Initialize cameras.
 
         Replace this if your camera stack is not RealSense-based.
@@ -414,17 +443,16 @@ class So101Env(gym.Env):
         if self.cap is not None:
             self.close_cameras()
 
+        assert name_serial_dict is not None, "Pass camera dict"
         self.cap = OrderedDict()
-        if not name_serial_dict:
-            return
 
         for cam_name, kwargs in name_serial_dict.items():
-            cap = VideoCapture(RSCapture(name=cam_name, **kwargs))
+            cap = VideoCapture(USBCapture(name=cam_name, **kwargs))
             self.cap[cam_name] = cap
 
     def close_cameras(self):
         try:
-            for cap in self.cap.values():
+            for cap in self.cap.values():  # type: ignore
                 cap.close()
         except Exception as e:
             print(f"Failed to close cameras: {e}")
@@ -438,41 +466,8 @@ class So101Env(gym.Env):
             self.img_queue.put(None)
             cv2.destroyAllWindows()
             self.displayer.join()
-
-    def _recover(self):
-        """Robot-specific error recovery hook."""
-        return None
-
-    def _reset_robot_joints(self):
-        """Optional joint reset hook for robots that need it."""
-        return None
-
-    def _send_pos_command(self, pos: np.ndarray):
-        """Send a pose command to the robot.
-
-        Expected pose format: [x, y, z, qx, qy, qz, qw].
-        """
-        raise NotImplementedError("Implement the SO101 pose command transport here.")
-
-    def _send_gripper_command(self, pos: float, mode: str = "binary"):
-        """Send a gripper command to the robot.
-
-        Keep the action convention compatible with the SERL policy:
-        negative values close, positive values open.
-        """
-        raise NotImplementedError("Implement the SO101 gripper command transport here.")
-
-    def _update_currpos(self):
-        """Read the latest robot state.
-
-        Populate:
-        - currpos: shape (7,)
-        - currvel: shape (6,)
-        - curr_gripper_pos: shape (1,)
-        """
-        raise NotImplementedError(
-            "Implement the SO101 state subscription/polling here."
-        )
+        if getattr(self, "ros_client", None):
+            self.ros_client.close()
 
     def _get_obs(self) -> dict:
         images = self.get_im()
@@ -482,3 +477,79 @@ class So101Env(gym.Env):
             "gripper_pose": self.curr_gripper_pos,
         }
         return copy.deepcopy(dict(images=images, state=state_observation))
+
+    def _recover(self):
+        """Robot-specific error recovery hook.
+
+        Override this if your robot needs special error handling.
+        Default is no-op.
+        """
+        pass
+
+    def _reset_robot_joints(self):
+        """Trigger joint reset action on the robot.
+
+        Contacts robot controller to home/reset all joints.
+        Override if your robot needs custom reset logic.
+        """
+        if self.ros_client is not None:
+            success = self.ros_client.reset_joints(timeout=30.0)
+            if not success:
+                print("[WARNING] Joint reset action did not complete")
+
+    def _send_pos_command(self, pos: np.ndarray):
+        """Send a pose command to the robot.
+
+        Expected pose format: [x, y, z, qx, qy, qz, qw].
+
+        Args:
+            pos: Desired pose as numpy array, shape (7,)
+        """
+        if self.ros_client is not None:
+            self.ros_client.send_pose(pos)
+
+    def _send_gripper_command(self, pos: float, mode: str = "binary"):
+        """Send a gripper command to the robot.
+
+        Publishes gripper angle continuously to the command topic.
+        Keep the action convention compatible with the SERL policy:
+        negative values close, positive values open.
+
+        Args:
+            pos: Gripper angle command in [-1, 1] range
+            mode: Control mode (default "binary", for future extensions)
+        """
+        if self.ros_client is not None:
+            self.ros_client.send_gripper(pos)
+
+    def _update_param(self, params: dict = None):  # type: ignore
+        """Update ROS2 parameters on the robot controller.
+
+        Sets parameters via the ROS2 parameter service.
+        Typical usage:
+        - COMPLIANCE_PARAM: compliance gains for force control
+        - PRECISION_PARAM: precision settings for movement accuracy
+        - RESET_PARAM: parameters for reset behavior
+
+        Args:
+            params: Dictionary of parameter names to values.
+                   Example: {"compliance_x": 100.0, "precision_threshold": 0.01}
+        """
+        if params and self.ros_client is not None:
+            success = self.ros_client.update_params(params)
+            if not success:
+                print(f"[WARNING] Failed to update parameters: {params}")
+
+    def _update_currpos(self):
+        """Read the latest robot state from ROS2 subscriptions.
+
+        Updates:
+        - currpos: shape (7,) [x, y, z, qx, qy, qz, qw]
+        - currvel: shape (6,) [vx, vy, vz, wx, wy, wz]
+        - curr_gripper_pos: shape (1,) [angle]
+        """
+        if self.ros_client is not None:
+            state = self.ros_client.get_state()
+            self.currpos = state["pose"].astype(np.float64)
+            self.currvel = state["vel"].astype(np.float64)
+            self.curr_gripper_pos = state["gripper"].astype(np.float64)
