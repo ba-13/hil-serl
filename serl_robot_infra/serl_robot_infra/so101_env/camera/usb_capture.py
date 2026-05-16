@@ -15,7 +15,7 @@ class USBCapture:
     - ``close()``
 
     Typical example for a Linux UVC wrist cam:
-    ``USBCapture(name="wrist", device="/dev/video0", dim=(640, 480), fps=30)``
+    ``USBCapture(name="cam_wrist", device="/dev/video2", dim=(640, 480), fps=30)``
     """
 
     def __init__(
@@ -48,7 +48,7 @@ class USBCapture:
         self.cap.set(cv2.CAP_PROP_FPS, int(fps))
 
         # Many cheap USB2.0 cameras behave better with MJPG on Linux.
-        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))  # type: ignore
 
         if exposure is not None:
             # Manual exposure semantics differ by backend/camera firmware.

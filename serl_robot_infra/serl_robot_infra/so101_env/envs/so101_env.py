@@ -9,8 +9,6 @@ wrappers and training configs:
   - tcp_pose: xyz + quat, shape (7,)
   - tcp_vel: shape (6,)
   - gripper_pose: shape (1,)
-  - tcp_force: shape (3,)
-  - tcp_torque: shape (3,)
 - observation['images']: dict of camera images, optionally empty
 
 Replace the transport hooks with your ROS publishers/subscribers.
@@ -32,9 +30,9 @@ import gymnasium as gym
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from franka_env.camera.rs_capture import RSCapture
-from franka_env.camera.video_capture import VideoCapture
-from franka_env.utils.rotations import euler_2_quat
+from serl_robot_infra.so101_env.camera.usb_capture import USBCapture
+from serl_robot_infra.so101_env.camera.video_capture import VideoCapture
+from serl_robot_infra.franka_env.utils.rotations import euler_2_quat
 
 
 class ImageDisplayer(threading.Thread):
@@ -51,25 +49,28 @@ class ImageDisplayer(threading.Thread):
                 break
 
             frame = np.concatenate(
-                [
-                    cv2.resize(v, (128, 128))
-                    for k, v in img_array.items()
-                    if "full" not in k
-                ],
-                axis=1,
+                [cv2.resize(v, (128, 128)) for k, v in img_array.items() if "full" not in k], axis=1
             )
 
             cv2.imshow(self.name, frame)
             cv2.waitKey(1)
 
 
+# This is a parent class
+# should be overwritten per experiment
 class DefaultSO101EnvConfig:
     """Default configuration for `So101Env`.
 
     Fill these in for your robot, camera setup, and task.
     """
 
-    CAMERAS: Dict = {"cam_wrist": {"id": "/dev/cam_wrist", "size": (480, 640)}}
+    CAMERAS: Dict = {
+        "cam_wrist": {
+            "serial_number": "/dev/cam_wrist",
+            "dim": (640, 480),
+            "exposure": 10500,
+        }
+    }
     IMAGE_CROP: dict[str, callable] = {}
 
     TARGET_POSE: np.ndarray = np.zeros((6,))
@@ -119,7 +120,9 @@ class So101Env(gym.Env):
         self.action_scale = np.asarray(self.config.ACTION_SCALE)
         self._TARGET_POSE = np.asarray(self.config.TARGET_POSE)
         self._RESET_POSE = np.asarray(self.config.RESET_POSE)
-        self._REWARD_THRESHOLD = np.asarray(self.config.REWARD_THRESHOLD)
+        self._REWARD_THRESHOLD = np.asarray(
+            self.config.REWARD_THRESHOLD
+        )  # being within the target pose to get the reward
         self.max_episode_length = self.config.MAX_EPISODE_LENGTH
         self.display_image = self.config.DISPLAY_IMAGE
         self.gripper_sleep = self.config.GRIPPER_SLEEP
@@ -154,7 +157,7 @@ class So101Env(gym.Env):
 
         #### Define Action Space ####
         self.action_space = gym.spaces.Box(
-            low=-np.ones((7,), dtype=np.float32),
+            low=np.ones((7,), dtype=np.float32) * -1,
             high=np.ones((7,), dtype=np.float32),
             dtype=np.float32,
         )
@@ -169,7 +172,9 @@ class So101Env(gym.Env):
                         ),  # xyz,quat
                         "tcp_vel": gym.spaces.Box(-np.inf, np.inf, shape=(6,)),
                         "gripper_pose": gym.spaces.Box(-1, 1, shape=(1,)),
-                        "goal_pose": gym.spaces.Box(-np.inf, np.inf, shape=(3,)), # goal
+                        "goal_pose": gym.spaces.Box(
+                            -np.inf, np.inf, shape=(3,)
+                        ),  # goal, should belong in the environment instead
                     }
                 ),
                 "images": gym.spaces.Dict(
@@ -177,60 +182,46 @@ class So101Env(gym.Env):
                         key: gym.spaces.Box(
                             0,
                             255,
-                            shape=(*val["size"], 3),
+                            shape=(*val["dim"], 3), # W x H x C
                             dtype=np.uint8,
                         )
                         for key, val in self.config.CAMERAS
                     }
                 ),
-                "masks": gym.spaces.Dict(
-                    {
-                        "target_mask": gym.spaces.Box(
-                            0,
-                            1,
-                            shape=(*self.config.CAMERAS["cam_wrist"]["size"], 1),
-                            dtype=np.uint8,
-                        )
-                    }
-                ),
             }
         )
 
+        # initialize states that is remembered
+        self.currpos = self.resetpos.copy()
+        self.currvel = np.zeros((6,), dtype=np.float64)
+        self.curr_gripper_pos = np.zeros((1,), dtype=np.float64)
+        self.q = np.zeros((7,), dtype=np.float64)
+        self.dq = np.zeros((7,), dtype=np.float64)
+
         if fake_env:
-            self._init_fake_state()
             self.cap = None
             return
 
-        self._init_state()
         self.cap = None
         self.init_cameras(self.config.CAMERAS)
-
         if self.display_image:
             self.img_queue = queue.Queue()
             self.displayer = ImageDisplayer(self.img_queue, "so101")
             self.displayer.start()
 
-    def _init_fake_state(self):
-        self.currpos = self.resetpos.copy()
-        self.currvel = np.zeros((6,), dtype=np.float64)
-        self.currforce = np.zeros((3,), dtype=np.float64)
-        self.currtorque = np.zeros((3,), dtype=np.float64)
-        self.curr_gripper_pos = np.zeros((1,), dtype=np.float64)
-        self.q = np.zeros((7,), dtype=np.float64)
-        self.dq = np.zeros((7,), dtype=np.float64)
+        if not fake_env:
+            from pynput import keyboard
 
-    def _init_state(self):
-        self._update_currpos()
-        if not hasattr(self, "currpos"):
-            self.currpos = self.resetpos.copy()
-        if not hasattr(self, "currvel"):
-            self.currvel = np.zeros((6,), dtype=np.float64)
-        if not hasattr(self, "currforce"):
-            self.currforce = np.zeros((3,), dtype=np.float64)
-        if not hasattr(self, "currtorque"):
-            self.currtorque = np.zeros((3,), dtype=np.float64)
-        if not hasattr(self, "curr_gripper_pos"):
-            self.curr_gripper_pos = np.zeros((1,), dtype=np.float64)
+            self.terminate = False
+
+            def on_press(key):
+                if key == keyboard.Key.esc:
+                    self.terminate = True
+
+            self.listener = keyboard.Listener(on_press=on_press)
+            self.listener.start()
+
+        print("Initialized SO101")
 
     def clip_safety_box(self, pose: np.ndarray) -> np.ndarray:
         pose = np.array(pose, copy=True)
@@ -248,7 +239,7 @@ class So101Env(gym.Env):
         euler[1:] = np.clip(
             euler[1:], self.rpy_bounding_box.low[1:], self.rpy_bounding_box.high[1:]
         )
-        pose[3:] = Rotation.from_euler("xyz", euler).as_quat()
+        pose[3:] = Rotation.from_euler("xyz", euler).as_quat(canonical=False)
         return pose
 
     def step(self, action: np.ndarray) -> tuple:
@@ -256,20 +247,21 @@ class So101Env(gym.Env):
         action = np.clip(action, self.action_space.low, self.action_space.high)
         xyz_delta = action[:3]
 
-        self.nextpos = self.currpos.copy()
+        self.nextpos = self.currpos.copy()  # angles aren't used
         self.nextpos[:3] = self.nextpos[:3] + xyz_delta * self.action_scale[0]
+        # GET ORIENTATION FROM ACTION
         self.nextpos[3:] = (
             Rotation.from_rotvec(action[3:6] * self.action_scale[1])
             * Rotation.from_quat(self.currpos[3:])
-        ).as_quat()
-
+        ).as_quat(canonical=False)
         gripper_action = action[6] * self.action_scale[2]
+
         self._send_gripper_command(gripper_action)
         self._send_pos_command(self.clip_safety_box(self.nextpos))
 
         self.curr_path_length += 1
         dt = time.time() - start_time
-        time.sleep(max(0.0, (1.0 / self.hz) - dt))
+        time.sleep(max(0.0, (1.0 / self.hz) - dt))  # TODO: Do we need this here?
 
         self._update_currpos()
         obs = self._get_obs()
@@ -295,8 +287,7 @@ class So101Env(gym.Env):
         return bool(np.all(delta < self._REWARD_THRESHOLD))
 
     def get_im(self) -> Dict[str, np.ndarray]:
-        if not getattr(self, "cap", None):
-            return {}
+        assert self.cap is not None
 
         images = {}
         display_images = {}
@@ -309,12 +300,12 @@ class So101Env(gym.Env):
                     if key in self.config.IMAGE_CROP
                     else rgb
                 )
-                resized = cv2.resize(
-                    cropped_rgb, self.observation_space["images"][key].shape[:2][::-1]
-                )
-                images[key] = resized[..., ::-1]
-                display_images[key] = resized
-                display_images[key + "_full"] = cropped_rgb
+                # target_shape = self.observation_space["images"][key].shape[:2][::-1]
+                # resized = cv2.resize(cropped_rgb, target_shape)
+                # cv reads with BGR, convert to RGB before sending
+                # images[key] = resized[..., ::-1]
+                images[key] = cv2.cvtColor(cropped_rgb, cv2.COLOR_BGR2RGB)
+                display_images[key] = cropped_rgb
                 full_res_images[key] = copy.deepcopy(cropped_rgb)
             except queue.Empty:
                 input(
@@ -402,7 +393,7 @@ class So101Env(gym.Env):
                     height, width = first_frame.shape[:2]
                     video_writer = cv2.VideoWriter(
                         video_path,
-                        cv2.VideoWriter_fourcc(*"mp4v"),
+                        cv2.VideoWriter_fourcc(*"mp4v"),  # type: ignore
                         10,
                         (width, height),
                     )
@@ -411,11 +402,11 @@ class So101Env(gym.Env):
                     video_writer.release()
                     print(f"Saved video for camera {camera_key} at {video_path}")
 
-            self.recording_frames.clear()
+            self.recording_frames.clear()  # type: ignore
         except Exception as e:
             print(f"Failed to save video: {e}")
 
-    def init_cameras(self, name_serial_dict=None):
+    def init_cameras(self, name_serial_dict: dict = None):
         """Initialize cameras.
 
         Replace this if your camera stack is not RealSense-based.
@@ -477,8 +468,6 @@ class So101Env(gym.Env):
         Populate:
         - currpos: shape (7,)
         - currvel: shape (6,)
-        - currforce: shape (3,)
-        - currtorque: shape (3,)
         - curr_gripper_pos: shape (1,)
         """
         raise NotImplementedError(
@@ -491,7 +480,5 @@ class So101Env(gym.Env):
             "tcp_pose": self.currpos,
             "tcp_vel": self.currvel,
             "gripper_pose": self.curr_gripper_pos,
-            "tcp_force": self.currforce,
-            "tcp_torque": self.currtorque,
         }
         return copy.deepcopy(dict(images=images, state=state_observation))

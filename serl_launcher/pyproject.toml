@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "serl_launcher"
+version = "0.1.2"
+description = "library for rl experiments"
+requires-python = ">=3.12"
+dependencies = [
+    "pyzmq",
+    "jax[cuda12]>=0.5.3",
+    "lz4",
+    "agentlace@git+https://github.com/youliangtan/agentlace.git@cf2c337c5e3694cdbfc14831b239bd657bc4894d",
+    "gym>=0.26",
+    "numpy>=1.24.3",
+    "flax>=0.8.0",
+    "distrax>=0.1.2",
+    "ml-collections>=0.1.0",
+    "tqdm>=4.60.0",
+    "chex>=0.1.85",
+    "optax>=0.1.5",
+    "absl-py>=0.12.0",
+    "scipy==1.11.4",
+    "wandb>=0.12.14",
+    "tensorflow>=2.15.0",
+    "tensorflow-probability>=0.23.0",
+    "einops>=0.6.1",
+    "imageio>=2.31.1",
+    "moviepy>=1.0.3",
+    "pre-commit==3.3.3",
+    "gymnasium==0.29.1",
+    "tf-keras",
+    "pynput",
+    "natsort",
+    "matplotlib",
+]
+
+[tool.uv.sources]
+
+# agentlace = { git = "https://github.com/youliangtan/agentlace.git@cf2c337c5e3694cdbfc14831b239bd657bc4894d" }
